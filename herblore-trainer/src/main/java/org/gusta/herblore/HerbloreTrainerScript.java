@@ -427,7 +427,6 @@ public class HerbloreTrainerScript extends Script {
             return;
         }
 
-        withdrawCoinsForGe(ctx, plan.cost);
         enqueueRestock(method, quote, plan);
         closeBank(ctx, "Going to GE for " + method.label + " supplies");
     }
@@ -501,21 +500,6 @@ public class HerbloreTrainerScript extends Script {
         }
         stats.lastGeAction = "Queued supplies for " + method.label + ": " + plan.describe();
         log(stats.lastGeAction);
-    }
-
-    private void withdrawCoinsForGe(APIContext ctx, long coinsNeeded) {
-        int inventoryCoins = ctx.inventory().getCount(true, COINS);
-        int bankCoins = ctx.bank().getCount(COINS);
-        int targetInventoryCoins = clampToInt(Math.min(Integer.MAX_VALUE, coinsNeeded));
-        if (inventoryCoins >= targetInventoryCoins || bankCoins <= 0) {
-            return;
-        }
-
-        int toWithdraw = Math.min(targetInventoryCoins - inventoryCoins, bankCoins);
-        stats.setStatus("Withdrawing " + toWithdraw + " coins for GE");
-        ctx.bank().selectWithdrawMode(IBankAPI.WithdrawMode.ITEM);
-        ctx.bank().withdraw(toWithdraw, COINS);
-        Time.sleep(600, 900);
     }
 
     private void processInventory(APIContext ctx, HerbloreMethod method) {
