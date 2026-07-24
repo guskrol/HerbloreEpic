@@ -21,11 +21,18 @@ import com.epicbot.api.shared.util.time.Time;
 import java.awt.Color;
 import java.awt.Point;
 import java.awt.Rectangle;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Queue;
 import java.util.concurrent.ThreadLocalRandom;
 
@@ -49,6 +56,7 @@ public class HerbloreTrainerScript extends Script {
     private final Queue<GeAction> pendingGeActions = new ArrayDeque<>();
     private final List<GeAction> placedGeActions = new ArrayList<>();
     private final Pricing pricing = new Pricing();
+    private final Watchdog watchdog = new Watchdog();
 
     private Stats stats;
     private HerbloreMethod activeMethod;
@@ -72,6 +80,7 @@ public class HerbloreTrainerScript extends Script {
         }
         String message = event.getMessage();
         stats.lastChat = message;
+        stats.recordEvent("CHAT: " + message);
         String lower = message.toLowerCase(Locale.ROOT);
         if (lower.contains("you do not have enough")
                 || lower.contains("not enough")
@@ -150,6 +159,10 @@ public class HerbloreTrainerScript extends Script {
             }
 
             stats.startExperienceIfNeeded(ctx);
+
+            if (watchdog.handleIfTriggered(ctx)) {
+                return;
+            }
 
             if (!pendingGeActions.isEmpty() || !placedGeActions.isEmpty()) {
                 handleGrandExchange(ctx);
@@ -639,6 +652,8 @@ public class HerbloreTrainerScript extends Script {
         if (processed > 0) {
             stats.actionsCompleted += processed;
             stats.lastProcessedAt = System.currentTimeMillis();
+            stats.recordEvent("PROGRESS: processed " + processed + "x "
+                    + method.label + "; totalActions=" + stats.actionsCompleted);
         }
     }
 
@@ -1259,6 +1274,707 @@ public class HerbloreTrainerScript extends Script {
         return (int) Math.max(0L, Math.min(Integer.MAX_VALUE, value));
     }
 
+    private class Watchdog {
+        private static final long WARMUP_MILLIS = 90_000L;
+        private static final long MIN_IDLE_STUCK_MILLIS = 2 * 60_000L;
+        private static final long MAX_IDLE_STUCK_MILLIS = 3 * 60_000L;
+        private static final long MIN_HARD_STUCK_MILLIS = 6 * 60_000L;
+        private static final long MAX_HARD_STUCK_MILLIS = 8 * 60_000L;
+        private static final long MIN_GE_WAIT_STUCK_MILLIS = 8 * 60_000L;
+        private static final long MAX_GE_WAIT_STUCK_MILLIS = 10 * 60_000L;
+        private static final long MIN_ABSOLUTE_STUCK_MILLIS = 12 * 60_000L;
+        private static final long MAX_ABSOLUTE_STUCK_MILLIS = 15 * 60_000L;
+        private static final long LOW_VARIANCE_LOOP_MILLIS = 3 * 60_000L;
+        private static final long INFO_LOG_INTERVAL_MILLIS = 75_000L;
+        private static final int TILE_PROGRESS_DISTANCE = 4;
+        private static final int RECENT_STATE_LIMIT = 24;
+
+        private final long startedAt = System.currentTimeMillis();
+        private final ArrayDeque<String> recentStateKeys = new ArrayDeque<>();
+        private Snapshot lastProgressSnapshot;
+        private String lastStateKey = "";
+        private Tile lastStableTile;
+        private long lastProgressAt;
+        private long sameStateSince;
+        private long sameTileSince;
+        private long nextInfoLogAt;
+        private long idleStuckMillis;
+        private long hardStuckMillis;
+        private long geWaitStuckMillis;
+        private long absoluteStuckMillis;
+        private boolean triggered;
+
+        private Watchdog() {
+            resetThresholds();
+        }
+
+        private boolean handleIfTriggered(APIContext ctx) {
+            if (triggered) {
+                Time.sleep(800, 1200);
+                return true;
+            }
+            if (ctx == null || ctx.script().isStopping()) {
+                return false;
+            }
+            if (!isLoggedIn(ctx)) {
+                executeStopOnly(ctx, "Watchdog stop: account is already logged out");
+                return true;
+            }
+
+            long now = System.currentTimeMillis();
+            Snapshot current = captureSnapshot(ctx);
+            if (lastProgressSnapshot == null) {
+                initialize(now, current);
+                return false;
+            }
+
+            if (current.hasMaterialProgressSince(lastProgressSnapshot)) {
+                initialize(now, current);
+                return false;
+            }
+
+            updateStableState(ctx, now, current);
+            if (now - startedAt < WARMUP_MILLIS) {
+                return false;
+            }
+
+            long noProgressFor = now - lastProgressAt;
+            long sameStateFor = now - sameStateSince;
+            long sameTileFor = now - sameTileSince;
+            boolean active = isPlayerActive(ctx);
+            boolean interfaceStuck = isBlockingInterfaceOpen(ctx);
+            boolean waitingOnGeOffer = !placedGeActions.isEmpty();
+            boolean lowVarianceLoop = recentStateKeys.size() >= 8
+                    && distinctRecentStateCount() <= 3
+                    && noProgressFor >= LOW_VARIANCE_LOOP_MILLIS;
+
+            String reason = null;
+            if (!active
+                    && !waitingOnGeOffer
+                    && noProgressFor >= idleStuckMillis
+                    && sameTileFor >= idleStuckMillis
+                    && sameStateFor >= idleStuckMillis / 2) {
+                reason = "Watchdog logout: idle without material progress for "
+                        + formatDuration(noProgressFor);
+            } else if (waitingOnGeOffer
+                    && noProgressFor >= geWaitStuckMillis
+                    && sameStateFor >= idleStuckMillis) {
+                reason = "Watchdog logout: GE offer wait without progress for "
+                        + formatDuration(noProgressFor);
+            } else if (lowVarianceLoop
+                    && sameTileFor >= idleStuckMillis) {
+                reason = "Watchdog logout: repeated low-variance loop for "
+                        + formatDuration(noProgressFor);
+            } else if (noProgressFor >= hardStuckMillis
+                    && sameTileFor >= hardStuckMillis / 2
+                    && (!active || interfaceStuck || sameStateFor >= idleStuckMillis)) {
+                reason = "Watchdog logout: hard stuck without material progress for "
+                        + formatDuration(noProgressFor);
+            } else if (noProgressFor >= absoluteStuckMillis) {
+                reason = "Watchdog logout: absolute no-progress limit reached after "
+                        + formatDuration(noProgressFor);
+            }
+
+            if (reason != null) {
+                executeLogout(ctx, reason, current, noProgressFor, sameStateFor, sameTileFor);
+                return true;
+            }
+
+            if (noProgressFor >= 90_000L && now >= nextInfoLogAt) {
+                getLogger().info("[Watchdog] No material progress for "
+                        + formatDuration(noProgressFor)
+                        + "; status='" + stats.status + "'"
+                        + "; method=" + methodLabel()
+                        + "; state=" + current.stateKey);
+                nextInfoLogAt = now + INFO_LOG_INTERVAL_MILLIS;
+            }
+
+            return false;
+        }
+
+        private void executeLogout(
+                APIContext ctx,
+                String reason,
+                Snapshot current,
+                long noProgressFor,
+                long sameStateFor,
+                long sameTileFor
+        ) {
+            triggered = true;
+            stats.setStatus(reason);
+            getLogger().info("[Watchdog] " + reason);
+
+            String beforeLogoutReport = buildReport(
+                    ctx,
+                    reason,
+                    current,
+                    noProgressFor,
+                    sameStateFor,
+                    sameTileFor,
+                    "pending",
+                    "pending",
+                    null
+            );
+
+            clearBlockingInterfaces(ctx);
+            waitUntilIdleForLogout(ctx);
+
+            boolean logoutRequested = false;
+            String logoutError = null;
+            try {
+                logoutRequested = ctx.game().logout();
+            } catch (RuntimeException e) {
+                logoutError = e.getClass().getSimpleName() + ": " + e.getMessage();
+                getLogger().info("[Watchdog] Logout request failed: " + logoutError);
+            }
+            Time.sleep(1200, 1800, () -> !isLoggedIn(ctx), 100);
+            boolean loggedOut = !isLoggedIn(ctx);
+
+            String finalReport = beforeLogoutReport
+                    + "logoutRequested=" + logoutRequested + '\n'
+                    + "loggedOutAfterRequest=" + loggedOut + '\n'
+                    + "logoutError=" + (logoutError == null ? "-" : logoutError) + '\n';
+            Path report = saveReport(finalReport);
+            getLogger().info("[Watchdog] Report saved: " + report);
+
+            stats.setStatus("Watchdog stopped script after logout attempt; report=" + report.getFileName());
+            HerbloreTrainerScript.this.stop(reason);
+        }
+
+        private void executeStopOnly(APIContext ctx, String reason) {
+            triggered = true;
+            long now = System.currentTimeMillis();
+            Snapshot current = captureSnapshot(ctx);
+            String reportText = buildReport(
+                    ctx,
+                    reason,
+                    current,
+                    lastProgressAt <= 0L ? 0L : Math.max(0L, now - lastProgressAt),
+                    sameStateSince <= 0L ? 0L : Math.max(0L, now - sameStateSince),
+                    sameTileSince <= 0L ? 0L : Math.max(0L, now - sameTileSince),
+                    "not-requested",
+                    "already-logged-out",
+                    null
+            ) + "logoutRequested=not-requested\n"
+                    + "loggedOutAfterRequest=already-logged-out\n"
+                    + "logoutError=-\n";
+            Path report = saveReport(reportText);
+            getLogger().info("[Watchdog] Account already logged out; report saved: " + report);
+            stats.setStatus(reason + "; report=" + report.getFileName());
+            HerbloreTrainerScript.this.stop(reason);
+        }
+
+        private void initialize(long now, Snapshot snapshot) {
+            lastProgressSnapshot = snapshot;
+            lastStateKey = snapshot.stateKey;
+            lastStableTile = snapshot.tile;
+            lastProgressAt = now;
+            sameStateSince = now;
+            sameTileSince = now;
+            nextInfoLogAt = now + INFO_LOG_INTERVAL_MILLIS;
+            recentStateKeys.clear();
+            rememberState(snapshot.stateKey);
+            resetThresholds();
+        }
+
+        private void updateStableState(APIContext ctx, long now, Snapshot snapshot) {
+            if (!snapshot.stateKey.equals(lastStateKey)) {
+                lastStateKey = snapshot.stateKey;
+                sameStateSince = now;
+            }
+            rememberState(snapshot.stateKey);
+
+            Tile currentTile = safeLocation(ctx);
+            if (lastStableTile == null
+                    || currentTile == null
+                    || tileDistance(lastStableTile, currentTile) >= TILE_PROGRESS_DISTANCE) {
+                lastStableTile = currentTile;
+                sameTileSince = now;
+            }
+        }
+
+        private void rememberState(String stateKey) {
+            recentStateKeys.addLast(stateKey == null ? "" : stateKey);
+            while (recentStateKeys.size() > RECENT_STATE_LIMIT) {
+                recentStateKeys.removeFirst();
+            }
+        }
+
+        private int distinctRecentStateCount() {
+            List<String> distinct = new ArrayList<>();
+            for (String stateKey : recentStateKeys) {
+                if (!distinct.contains(stateKey)) {
+                    distinct.add(stateKey);
+                }
+            }
+            return distinct.size();
+        }
+
+        private void clearBlockingInterfaces(APIContext ctx) {
+            try {
+                if (ctx.menu().isOpen()) {
+                    ctx.menu().closeMenu();
+                }
+                if (ctx.inventory().isItemSelected()) {
+                    ctx.inventory().deselectItem();
+                }
+                if (ctx.store().isOpen()) {
+                    ctx.store().close();
+                }
+                if (ctx.grandExchange().isOpen()) {
+                    ctx.grandExchange().close();
+                }
+                if (ctx.bank().isOpen()) {
+                    ctx.bank().close();
+                }
+                if (ctx.widgets().isInterfaceOpen()) {
+                    ctx.widgets().closeInterface();
+                }
+            } catch (RuntimeException e) {
+                getLogger().info("[Watchdog] Interface cleanup failed: "
+                        + e.getClass().getSimpleName() + ": " + e.getMessage());
+            }
+        }
+
+        private void waitUntilIdleForLogout(APIContext ctx) {
+            if (!isPlayerActive(ctx)) {
+                return;
+            }
+            stats.setStatus("Watchdog waiting until idle before logout");
+            Time.sleep(800, 1400, () -> !isPlayerActive(ctx), 100);
+        }
+
+        private Path saveReport(String reportText) {
+            try {
+                Path path = reportPath();
+                Files.createDirectories(path.getParent());
+                Files.writeString(path, reportText);
+                return path;
+            } catch (RuntimeException | IOException firstFailure) {
+                try {
+                    Path fallback = Path.of(
+                            System.getProperty("user.home", "."),
+                            "herblore-watchdog-reports",
+                            reportFileName()
+                    );
+                    Files.createDirectories(fallback.getParent());
+                    Files.writeString(fallback, reportText);
+                    return fallback;
+                } catch (RuntimeException | IOException secondFailure) {
+                    getLogger().info("[Watchdog] Could not save report: " + secondFailure.getMessage());
+                    return Path.of("watchdog-report-save-failed");
+                }
+            }
+        }
+
+        private Path reportPath() {
+            return Path.of(System.getProperty("user.dir", "."), "watchdog-reports", reportFileName());
+        }
+
+        private String reportFileName() {
+            String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"));
+            return "herblore-watchdog-" + timestamp + ".txt";
+        }
+
+        private String buildReport(
+                APIContext ctx,
+                String reason,
+                Snapshot snapshot,
+                long noProgressFor,
+                long sameStateFor,
+                long sameTileFor,
+                String logoutRequested,
+                String loggedOutAfterRequest,
+                String logoutError
+        ) {
+            StringBuilder report = new StringBuilder();
+            report.append("Herblore Cheapest 61 watchdog report\n");
+            report.append("version=").append(SCRIPT_VERSION).append('\n');
+            report.append("timestamp=").append(LocalDateTime.now()).append('\n');
+            report.append("reason=").append(reason).append('\n');
+            report.append("runtime=").append(stats.runtimeText()).append('\n');
+            report.append("status=").append(stats.status).append('\n');
+            report.append("lastChat=").append(stats.lastChat).append('\n');
+            report.append("lastGeAction=").append(stats.lastGeAction).append('\n');
+            report.append("actionsCompleted=").append(stats.actionsCompleted).append('\n');
+            report.append("lastProcessedAgo=").append(formatDurationSince(stats.lastProcessedAt)).append('\n');
+            report.append("activeMethod=").append(methodLabel()).append('\n');
+            report.append("activeQuote=").append(quoteText()).append('\n');
+            report.append("pendingGeActions=").append(geActionSummary(pendingGeActions)).append('\n');
+            report.append("placedGeActions=").append(geActionSummary(placedGeActions)).append('\n');
+            report.append("noProgressFor=").append(formatDuration(noProgressFor)).append('\n');
+            report.append("sameStateFor=").append(formatDuration(sameStateFor)).append('\n');
+            report.append("sameTileFor=").append(formatDuration(sameTileFor)).append('\n');
+            report.append("idleThreshold=").append(formatDuration(idleStuckMillis)).append('\n');
+            report.append("hardThreshold=").append(formatDuration(hardStuckMillis)).append('\n');
+            report.append("geWaitThreshold=").append(formatDuration(geWaitStuckMillis)).append('\n');
+            report.append("absoluteThreshold=").append(formatDuration(absoluteStuckMillis)).append('\n');
+            report.append("stateKey=").append(snapshot.stateKey).append('\n');
+            report.append("recentDistinctStates=").append(distinctRecentStateCount()).append('\n');
+            report.append("loggedIn=").append(isLoggedIn(ctx)).append('\n');
+            report.append("location=").append(locationText(ctx)).append('\n');
+            report.append("playerActive=").append(isPlayerActive(ctx)).append('\n');
+            report.append("moving=").append(safePlayerFlag(ctx, PlayerFlag.MOVING)).append('\n');
+            report.append("animating=").append(safePlayerFlag(ctx, PlayerFlag.ANIMATING)).append('\n');
+            report.append("inCombat=").append(safePlayerFlag(ctx, PlayerFlag.IN_COMBAT)).append('\n');
+            report.append("attacking=").append(safePlayerFlag(ctx, PlayerFlag.ATTACKING)).append('\n');
+            report.append("bankOpen=").append(safeInterfaceFlag(ctx, InterfaceFlag.BANK)).append('\n');
+            report.append("geOpen=").append(safeInterfaceFlag(ctx, InterfaceFlag.GE)).append('\n');
+            report.append("storeOpen=").append(safeInterfaceFlag(ctx, InterfaceFlag.STORE)).append('\n');
+            report.append("menuOpen=").append(safeInterfaceFlag(ctx, InterfaceFlag.MENU)).append('\n');
+            report.append("dialogueOpen=").append(safeInterfaceFlag(ctx, InterfaceFlag.DIALOGUE)).append('\n');
+            report.append("chatOpen=").append(safeInterfaceFlag(ctx, InterfaceFlag.CHAT)).append('\n');
+            report.append("itemSelected=").append(safeInterfaceFlag(ctx, InterfaceFlag.ITEM_SELECTED)).append('\n');
+            report.append("inventory=").append(itemSummary(safeInventoryItems(ctx))).append('\n');
+            report.append("equipment=").append(itemSummary(safeEquipmentItems(ctx))).append('\n');
+            report.append("bank=").append(safeInterfaceFlag(ctx, InterfaceFlag.BANK)
+                    ? itemSummary(safeBankItems(ctx))
+                    : "not open").append('\n');
+            report.append("recentEvents:\n");
+            List<String> events = stats.recentEvents(80);
+            if (events.isEmpty()) {
+                report.append("- none\n");
+            } else {
+                for (String event : events) {
+                    report.append("- ").append(event).append('\n');
+                }
+            }
+            return report.toString();
+        }
+
+        private void resetThresholds() {
+            idleStuckMillis = randomLong(MIN_IDLE_STUCK_MILLIS, MAX_IDLE_STUCK_MILLIS);
+            hardStuckMillis = randomLong(MIN_HARD_STUCK_MILLIS, MAX_HARD_STUCK_MILLIS);
+            geWaitStuckMillis = randomLong(MIN_GE_WAIT_STUCK_MILLIS, MAX_GE_WAIT_STUCK_MILLIS);
+            absoluteStuckMillis = randomLong(MIN_ABSOLUTE_STUCK_MILLIS, MAX_ABSOLUTE_STUCK_MILLIS);
+        }
+
+        private long randomLong(long minInclusive, long maxInclusive) {
+            return ThreadLocalRandom.current().nextLong(minInclusive, maxInclusive + 1L);
+        }
+
+        private boolean isLoggedIn(APIContext ctx) {
+            try {
+                return ctx.client().isLoggedIn();
+            } catch (RuntimeException ignored) {
+                return false;
+            }
+        }
+
+        private boolean isPlayerActive(APIContext ctx) {
+            return safePlayerFlag(ctx, PlayerFlag.MOVING)
+                    || safePlayerFlag(ctx, PlayerFlag.ANIMATING)
+                    || safePlayerFlag(ctx, PlayerFlag.IN_COMBAT)
+                    || safePlayerFlag(ctx, PlayerFlag.ATTACKING);
+        }
+
+        private boolean isBlockingInterfaceOpen(APIContext ctx) {
+            return safeInterfaceFlag(ctx, InterfaceFlag.BANK)
+                    || safeInterfaceFlag(ctx, InterfaceFlag.GE)
+                    || safeInterfaceFlag(ctx, InterfaceFlag.STORE)
+                    || safeInterfaceFlag(ctx, InterfaceFlag.MENU)
+                    || safeInterfaceFlag(ctx, InterfaceFlag.DIALOGUE)
+                    || safeInterfaceFlag(ctx, InterfaceFlag.ITEM_SELECTED);
+        }
+
+        private boolean safePlayerFlag(APIContext ctx, PlayerFlag flag) {
+            try {
+                if (flag == PlayerFlag.MOVING) {
+                    return ctx.localPlayer().isMoving();
+                }
+                if (flag == PlayerFlag.ANIMATING) {
+                    return ctx.localPlayer().isAnimating();
+                }
+                if (flag == PlayerFlag.IN_COMBAT) {
+                    return ctx.localPlayer().isInCombat();
+                }
+                if (flag == PlayerFlag.ATTACKING) {
+                    return ctx.localPlayer().isAttacking();
+                }
+            } catch (RuntimeException ignored) {
+                return false;
+            }
+            return false;
+        }
+
+        private boolean safeInterfaceFlag(APIContext ctx, InterfaceFlag flag) {
+            try {
+                if (flag == InterfaceFlag.BANK) {
+                    return ctx.bank().isOpen();
+                }
+                if (flag == InterfaceFlag.GE) {
+                    return ctx.grandExchange().isOpen();
+                }
+                if (flag == InterfaceFlag.STORE) {
+                    return ctx.store().isOpen();
+                }
+                if (flag == InterfaceFlag.MENU) {
+                    return ctx.menu().isOpen();
+                }
+                if (flag == InterfaceFlag.DIALOGUE) {
+                    return ctx.dialogues().isDialogueOpen();
+                }
+                if (flag == InterfaceFlag.CHAT) {
+                    return ctx.dialogues().isChatOpen();
+                }
+                if (flag == InterfaceFlag.ITEM_SELECTED) {
+                    return ctx.inventory().isItemSelected();
+                }
+            } catch (RuntimeException ignored) {
+                return false;
+            }
+            return false;
+        }
+
+        private Tile safeLocation(APIContext ctx) {
+            try {
+                return ctx.localPlayer().getLocation();
+            } catch (RuntimeException ignored) {
+                return null;
+            }
+        }
+
+        private Iterable<? extends ItemWidget> safeInventoryItems(APIContext ctx) {
+            try {
+                return ctx.inventory().getItems();
+            } catch (RuntimeException ignored) {
+                return List.of();
+            }
+        }
+
+        private Iterable<? extends ItemWidget> safeEquipmentItems(APIContext ctx) {
+            try {
+                return ctx.equipment().getItems();
+            } catch (RuntimeException ignored) {
+                return List.of();
+            }
+        }
+
+        private Iterable<? extends ItemWidget> safeBankItems(APIContext ctx) {
+            try {
+                return ctx.bank().getItems();
+            } catch (RuntimeException ignored) {
+                return List.of();
+            }
+        }
+
+        private String methodLabel() {
+            return activeMethod == null ? "-" : activeMethod.label;
+        }
+
+        private String quoteText() {
+            if (activeQuote == null || !activeQuote.hasPrices()) {
+                return "-";
+            }
+            return "cost/action=" + activeQuote.netCostPerAction
+                    + ", cost/xp=" + formatGpPerXp(activeQuote.netCostPerXp)
+                    + ", inputCost=" + activeQuote.inputCost
+                    + ", outputRevenue=" + activeQuote.outputRevenue;
+        }
+
+        private String geActionSummary(Iterable<GeAction> actions) {
+            List<String> parts = new ArrayList<>();
+            for (GeAction action : actions) {
+                parts.add(action.describe());
+            }
+            return parts.isEmpty() ? "none" : String.join("; ", parts);
+        }
+
+        private String locationText(APIContext ctx) {
+            Tile tile = safeLocation(ctx);
+            if (tile == null) {
+                return "unknown";
+            }
+            return tile.getX() + "," + tile.getY() + "," + tile.getPlane();
+        }
+
+        private String itemSummary(Iterable<? extends ItemWidget> items) {
+            Map<String, Integer> counts = new LinkedHashMap<>();
+            for (ItemWidget item : items) {
+                if (item == null || item.getName() == null || item.getName().isBlank()) {
+                    continue;
+                }
+                String key = item.getName() + (item.isNoted() ? " (noted)" : "");
+                int amount = Math.max(1, item.getStackSize());
+                counts.merge(key, amount, Integer::sum);
+            }
+
+            if (counts.isEmpty()) {
+                return "empty";
+            }
+
+            StringBuilder summary = new StringBuilder();
+            boolean first = true;
+            for (Map.Entry<String, Integer> entry : counts.entrySet()) {
+                if (!first) {
+                    summary.append(", ");
+                }
+                summary.append(entry.getKey()).append(" x").append(entry.getValue());
+                first = false;
+            }
+            return summary.toString();
+        }
+
+        private String formatDurationSince(long sinceMillis) {
+            if (sinceMillis <= 0L) {
+                return "never";
+            }
+            return formatDuration(System.currentTimeMillis() - sinceMillis);
+        }
+
+        private String formatDuration(long millis) {
+            long seconds = Math.max(0L, millis / 1000L);
+            long minutes = seconds / 60L;
+            long remainingSeconds = seconds % 60L;
+            return minutes + "m " + remainingSeconds + "s";
+        }
+
+        private int tileDistance(Tile left, Tile right) {
+            if (left == null || right == null || left.getPlane() != right.getPlane()) {
+                return Integer.MAX_VALUE;
+            }
+            return Math.max(Math.abs(left.getX() - right.getX()), Math.abs(left.getY() - right.getY()));
+        }
+
+        private Snapshot captureSnapshot(APIContext ctx) {
+            return new Snapshot(
+                    safeHerbloreXp(ctx),
+                    safeHerbloreLevel(ctx),
+                    stats.actionsCompleted,
+                    itemFingerprint(safeInventoryItems(ctx)),
+                    itemFingerprint(safeEquipmentItems(ctx)),
+                    safeInterfaceFlag(ctx, InterfaceFlag.BANK) ? itemFingerprint(safeBankItems(ctx)) : 0,
+                    pendingGeActions.size(),
+                    placedGeActions.size(),
+                    methodLabel(),
+                    stats.status,
+                    stats.lastGeAction,
+                    safeLocation(ctx)
+            );
+        }
+
+        private int safeHerbloreXp(APIContext ctx) {
+            try {
+                return ctx.skills().get(Skill.Skills.HERBLORE).getExperience();
+            } catch (RuntimeException ignored) {
+                return 0;
+            }
+        }
+
+        private int safeHerbloreLevel(APIContext ctx) {
+            try {
+                return ctx.skills().get(Skill.Skills.HERBLORE).getRealLevel();
+            } catch (RuntimeException ignored) {
+                return 0;
+            }
+        }
+
+        private int itemFingerprint(Iterable<? extends ItemWidget> items) {
+            int result = 17;
+            for (ItemWidget item : items) {
+                if (item == null || item.getName() == null || item.getName().isBlank()) {
+                    continue;
+                }
+
+                result = 31 * result + item.getIndex();
+                result = 31 * result + item.getId();
+                result = 31 * result + item.getStackSize();
+                result = 31 * result + (item.isNoted() ? 1 : 0);
+            }
+            return result;
+        }
+
+        private enum PlayerFlag {
+            MOVING,
+            ANIMATING,
+            IN_COMBAT,
+            ATTACKING
+        }
+
+        private enum InterfaceFlag {
+            BANK,
+            GE,
+            STORE,
+            MENU,
+            DIALOGUE,
+            CHAT,
+            ITEM_SELECTED
+        }
+
+        private class Snapshot {
+            private final int herbloreXp;
+            private final int herbloreLevel;
+            private final int actionsCompleted;
+            private final int inventoryFingerprint;
+            private final int equipmentFingerprint;
+            private final int bankFingerprint;
+            private final int pendingGeCount;
+            private final int placedGeCount;
+            private final String activeMethodLabel;
+            private final String status;
+            private final String lastGeAction;
+            private final String stateKey;
+            private final Tile tile;
+
+            private Snapshot(
+                    int herbloreXp,
+                    int herbloreLevel,
+                    int actionsCompleted,
+                    int inventoryFingerprint,
+                    int equipmentFingerprint,
+                    int bankFingerprint,
+                    int pendingGeCount,
+                    int placedGeCount,
+                    String activeMethodLabel,
+                    String status,
+                    String lastGeAction,
+                    Tile tile
+            ) {
+                this.herbloreXp = herbloreXp;
+                this.herbloreLevel = herbloreLevel;
+                this.actionsCompleted = actionsCompleted;
+                this.inventoryFingerprint = inventoryFingerprint;
+                this.equipmentFingerprint = equipmentFingerprint;
+                this.bankFingerprint = bankFingerprint;
+                this.pendingGeCount = pendingGeCount;
+                this.placedGeCount = placedGeCount;
+                this.activeMethodLabel = activeMethodLabel == null ? "" : activeMethodLabel;
+                this.status = status == null ? "" : status;
+                this.lastGeAction = lastGeAction == null ? "" : lastGeAction;
+                this.tile = tile;
+                this.stateKey = buildStateKey();
+            }
+
+            private boolean hasMaterialProgressSince(Snapshot previous) {
+                return herbloreXp != previous.herbloreXp
+                        || herbloreLevel != previous.herbloreLevel
+                        || actionsCompleted != previous.actionsCompleted
+                        || inventoryFingerprint != previous.inventoryFingerprint
+                        || equipmentFingerprint != previous.equipmentFingerprint
+                        || bankFingerprint != previous.bankFingerprint
+                        || pendingGeCount != previous.pendingGeCount
+                        || placedGeCount != previous.placedGeCount
+                        || !lastGeAction.equals(previous.lastGeAction);
+            }
+
+            private String buildStateKey() {
+                return activeMethodLabel
+                        + "|status=" + status
+                        + "|ge=" + pendingGeCount + "/" + placedGeCount
+                        + "|tile=" + tileText(tile)
+                        + "|inv=" + inventoryFingerprint
+                        + "|bank=" + bankFingerprint;
+            }
+
+            private String tileText(Tile tile) {
+                if (tile == null) {
+                    return "unknown";
+                }
+                return tile.getX() + "," + tile.getY() + "," + tile.getPlane();
+            }
+        }
+    }
+
     private enum MethodType {
         CLEAN,
         POTION,
@@ -1631,13 +2347,19 @@ public class HerbloreTrainerScript extends Script {
     }
 
     private static class Stats {
+        private static final int MAX_RECENT_EVENTS = 140;
+        private static final DateTimeFormatter EVENT_TIME_FORMAT =
+                DateTimeFormatter.ofPattern("HH:mm:ss");
+
         private final long startedAt = System.currentTimeMillis();
+        private final ArrayDeque<String> events = new ArrayDeque<>();
         private int startingHerbloreXp = -1;
         private int actionsCompleted;
         private long lastProcessedAt;
         private String status = "Starting";
         private String lastChat = "-";
         private String lastGeAction = "-";
+        private String lastRecordedEvent = "";
 
         private void startExperienceIfNeeded(APIContext ctx) {
             if (ctx == null || startingHerbloreXp >= 0) {
@@ -1667,7 +2389,39 @@ public class HerbloreTrainerScript extends Script {
         }
 
         private void setStatus(String status) {
-            this.status = status == null ? "-" : status;
+            String sanitized = sanitize(status, "-");
+            this.status = sanitized;
+            recordEvent("STATUS: " + sanitized);
+        }
+
+        private void recordEvent(String event) {
+            String sanitized = sanitize(event, "");
+            if (sanitized.isBlank() || sanitized.equals(lastRecordedEvent)) {
+                return;
+            }
+
+            lastRecordedEvent = sanitized;
+            events.addLast(LocalDateTime.now().format(EVENT_TIME_FORMAT) + " " + sanitized);
+            while (events.size() > MAX_RECENT_EVENTS) {
+                events.removeFirst();
+            }
+        }
+
+        private List<String> recentEvents(int limit) {
+            List<String> snapshot = new ArrayList<>(events);
+            if (limit <= 0 || snapshot.size() <= limit) {
+                return snapshot;
+            }
+            return new ArrayList<>(snapshot.subList(snapshot.size() - limit, snapshot.size()));
+        }
+
+        private String sanitize(String value, String fallback) {
+            String sanitized = value == null ? fallback : value;
+            sanitized = sanitized.replace('\n', ' ').replace('\r', ' ').trim();
+            if (sanitized.length() > 240) {
+                return sanitized.substring(0, 237) + "...";
+            }
+            return sanitized;
         }
     }
 }
